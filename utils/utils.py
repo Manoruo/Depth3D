@@ -21,20 +21,19 @@ def back_project(fx, fy, depth, cx, cy):
 
 
 
-def make_o3d_pointcloud(rgb_path, depth_path, T, fx, fy, cx, cy):
+def make_pointcloud(rgb, depth, T, fx, fy, cx, cy, max_dist=None):
     
-    if type(rgb_path) != str:
-        rgb = rgb_path
-    else:
-        rgb = cv2.imread(rgb_path)[:, :, ::-1]
+    if type(rgb) == str:
+        rgb = cv2.imread(rgb)[:, :, ::-1]
     
-    if type(depth_path) != str:
-        depth = depth_path
-    else:
-        depth = np.load(depth_path).astype(np.float32) / 1000 ## convert mm depth map to meter
+    if type(depth) == str:
+        depth = np.load(depth).astype(np.float32) / 1000 ## convert mm depth map to meter
 
     # ----- CREATE MASK -----
     mask = (depth > 0) & np.isfinite(depth)   # boolean mask HxW
+
+    if max_dist:
+        mask = mask & (depth <= max_dist)
 
     # Unproject entire depth → xyz
     p_cam = back_project(fx, fy, depth, cx, cy)   # HxW x 3
@@ -89,3 +88,78 @@ def create_frame(T, size=0.1):
     frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
     frame.transform(T)  # place it in the world
     return frame
+
+
+def merge_point_clouds_from_data(pcd1_w, pcd2_w, T_world_cam1=None, T_world_cam2=None,
+                                 max_depth=3, voxel_size_icp=0.3, voxel_size_fuse=0.02):
+    """
+    Merge two point clouds with ICP alignment using provided poses.
+
+    Args:
+        pcd1_w (o3d.geometry.PointCloud): First point cloud.
+        pcd2_w (o3d.geometry.PointCloud): Second point cloud.
+        T_world_cam1 (np.ndarray): 4x4 pose of first camera.
+        T_world_cam2 (np.ndarray): 4x4 pose of second camera.
+        max_depth (float): Depth threshold for filtering.
+        voxel_size_icp (float): Voxel size for ICP downsampling.
+        voxel_size_fuse (float): Voxel size for final fused cloud.
+
+    Returns:
+        o3d.geometry.PointCloud: Merged and fused point cloud.
+    """
+    # Filter by depth
+    pcd1_w = pcd1_w.select_by_index(
+        np.where(np.asarray(pcd1_w.points)[:, 2] < max_depth)[0]
+    )
+    pcd2_w = pcd2_w.select_by_index(
+        np.where(np.asarray(pcd2_w.points)[:, 2] < max_depth)[0]
+    )
+
+    # Initial relative transform
+    if T_world_cam1 and T_world_cam2:
+
+        T_init = np.linalg.inv(T_world_cam2) @ T_world_cam1
+    else:
+        T_init = np.eye(4)
+    # Downsample for ICP
+    pcd1_ds = pcd1_w.voxel_down_sample(voxel_size_icp)
+    pcd2_ds = pcd2_w.voxel_down_sample(voxel_size_icp)
+
+    # Noise filtering
+    pcd1_ds, _ = pcd1_ds.remove_radius_outlier(nb_points=5, radius=voxel_size_icp*3)
+    pcd2_ds, _ = pcd2_ds.remove_radius_outlier(nb_points=5, radius=voxel_size_icp*3)
+
+    # Estimate normals
+    pcd1_ds.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(
+        radius=voxel_size_icp*2, max_nn=30))
+    pcd2_ds.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(
+        radius=voxel_size_icp*2, max_nn=30))
+
+    # Colored ICP
+    # result_icp = o3d.pipelines.registration.registration_colored_icp(
+    #     source=pcd2_ds,
+    #     target=pcd1_ds,
+    #     max_correspondence_distance=3,
+    #     init=T_init
+    # )
+    result_icp = o3d.pipelines.registration.registration_icp(
+    pcd2_ds, pcd1_ds, 1, T_init,
+    o3d.pipelines.registration.TransformationEstimationForGeneralizedICP())
+
+    print(f"Colored ICP fitness: {result_icp.fitness:.3f}")
+    print(f"Colored ICP RMSE: {result_icp.inlier_rmse:.3f}")
+
+    # Apply transformation to full-res cloud
+    pcd2_w.transform(result_icp.transformation)
+
+    # Merge clouds
+    pcd_combined = o3d.geometry.PointCloud()
+    pcd_combined += pcd1_w
+    pcd_combined += pcd2_w
+
+    # Final voxel downsample for fusion
+    pcd_fused = pcd_combined.voxel_down_sample(voxel_size_fuse)
+
+    return pcd_fused
+
+
